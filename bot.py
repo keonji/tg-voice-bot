@@ -1,140 +1,184 @@
-import os
-import logging
-import wave
-import json
-import subprocess
-from telegram import Update
-from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler
-from telegram.ext import filters
-from vosk import Model, KaldiRecognizer
+"""
+Telegram бот транскрибации голосовых и видеосообщений.
+"""
 
-# Включаем логирование
+import os
+import sys
+import logging
+from pathlib import Path
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, Defaults
+from dotenv import load_dotenv
+import pytz
+
+# Импорты модулей бота
+from security import get_auth_manager
+from handlers import (
+    start_command, status_command,
+    voice_message_handler, video_note_message_handler
+)
+from utils import cleanup_temp_files
+
+# Загружаем переменные окружения
+load_dotenv()
+
+# Настройка логирования
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.DEBUG  # Устанавливаем уровень DEBUG для подробной информации
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+    stream=sys.stdout
 )
 logger = logging.getLogger(__name__)
 
-# Загрузка модели Vosk
-if not os.path.exists("model"):
-    logger.error("Пожалуйста, скачайте модель Vosk и поместите ее в папку 'model'.")
-    exit(1)
+# Отключаем избыточное логирование
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
 
-model = Model("model")
 
-async def voice_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        voice = update.message.voice
-        user_name = update.message.from_user.full_name
-        logger.info(f"Получено голосовое сообщение от {user_name}")
+class BotConfig:
+    """Конфигурация бота."""
 
-        # Скачиваем голосовое сообщение
-        file = await context.bot.get_file(voice.file_id)
-        file_path = 'voice.ogg'
-        await file.download_to_drive(file_path)
-        logger.info("Голосовое сообщение скачано")
+    def __init__(self):
+        """Инициализация конфигурации."""
+        self.BOT_TOKEN = os.getenv("BOT_TOKEN")
+        if not self.BOT_TOKEN:
+            raise ValueError("BOT_TOKEN не установлен в переменных окружения")
 
-        # Проверяем размер файла OGG
-        if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
-            logger.error("Файл voice.ogg не существует или пустой")
-            await update.message.reply_text(
-                f"<b>{user_name}:</b>\n[Ошибка при скачивании голосового сообщения]",
-                parse_mode='HTML'
-            )
-            return
+        self.AUDIO_TEMP_DIR = Path(os.getenv("AUDIO_TEMP_DIR", "./temp_audio"))
+        self.MODELS_DIR = Path(os.getenv("MODELS_DIR", "./models"))
 
-        # Конвертируем OGG в WAV с частотой 16000 Гц и одним каналом
-        command = [
-            'ffmpeg', '-y', '-i', 'voice.ogg',
-            '-ar', '16000',  # Устанавливаем частоту дискретизации
-            '-ac', '1',      # Устанавливаем количество каналов
-            'voice.wav'
-        ]
-        subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        logger.info("Голосовое сообщение конвертировано в WAV")
+        for directory in [self.AUDIO_TEMP_DIR, self.MODELS_DIR]:
+            directory.mkdir(parents=True, exist_ok=True)
 
-        # Проверяем размер файла WAV
-        if not os.path.exists('voice.wav') or os.path.getsize('voice.wav') == 0:
-            logger.error("Файл voice.wav не существует или пустой")
-            await update.message.reply_text(
-                f"<b>{user_name}:</b>\n[Ошибка при конвертации голосового сообщения]",
-                parse_mode='HTML'
-            )
-            return
+        self.TIME_ZONE = os.getenv("TIME_ZONE", "Europe/Moscow")
+        self.CLEANUP_INTERVAL = int(os.getenv("CLEANUP_INTERVAL", "24"))
 
-        ogg_size = os.path.getsize('voice.ogg')
-        wav_size = os.path.getsize('voice.wav')
-        logger.info(f"Размер voice.ogg: {ogg_size} байт")
-        logger.info(f"Размер voice.wav: {wav_size} байт")
+        logger.info("Конфигурация бота загружена")
 
-        # Распознаем речь с помощью Vosk
-        try:
-            wf = wave.open('voice.wav', 'rb')
-        except Exception as e:
-            logger.exception("Ошибка при открытии файла voice.wav")
-            await update.message.reply_text(
-                f"<b>{user_name}:</b>\n[Ошибка при обработке голосового сообщения]",
-                parse_mode='HTML'
-            )
-            return
 
-        rec = KaldiRecognizer(model, wf.getframerate())
-        logger.info("Начато распознавание речи")
+class TelegramBot:
+    """Основной класс Telegram бота."""
 
-        results = []
-        while True:
-            data = wf.readframes(4000)
-            if len(data) == 0:
-                break
-            if rec.AcceptWaveform(data):
-                res = json.loads(rec.Result())
-                logger.debug(f"Partial result: {res}")
-                results.append(res.get('text', ''))
-        res = json.loads(rec.FinalResult())
-        logger.debug(f"Final result: {res}")
-        results.append(res.get('text', ''))
+    def __init__(self):
+        """Инициализация бота."""
+        self.config = BotConfig()
+        self.application = None
+        self.auth_manager = None
 
-        text = ' '.join(results).strip()
-        logger.info(f"Распознавание завершено, полученный текст: '{text}'")
+    async def _post_init_callback(self, application):
+        """Callback, вызываемый после инициализации приложения."""
+        await self._startup_check()
 
-        # Удаляем временные файлы
-        wf.close()
-        os.remove('voice.ogg')
-        os.remove('voice.wav')
-        logger.info("Временные файлы удалены")
+    async def _startup_check(self):
+        """Проверка готовности системы при запуске."""
+        logger.info("🚀 Проверка готовности системы...")
 
-        # Проверяем, что текст не пустой
-        if text:
-            # Отправляем отформатированное сообщение
-            response = f"<b>{user_name}:</b>\n{text}"
-            await update.message.reply_text(response, parse_mode='HTML')
-            logger.info("Отправлено сообщение с расшифровкой")
+        self.auth_manager = get_auth_manager()
+        admin_count = self.auth_manager.get_admin_count()
+        if admin_count == 0:
+            logger.warning("⚠️ Не настроены администраторы бота!")
+            logger.warning("Добавьте в .env: ADMIN_USER_IDS=123456789,987654321")
         else:
-            logger.warning("Распознанный текст пустой")
-            await update.message.reply_text(
-                f"<b>{user_name}:</b>\n[Не удалось распознать речь]",
-                parse_mode='HTML'
+            logger.info(f"✅ Настроено администраторов: {admin_count}")
+
+        logger.info("🎯 Система готова к работе!")
+
+    def _setup_handlers(self):
+        """Настройка обработчиков команд и сообщений."""
+        app = self.application
+
+        app.add_handler(CommandHandler("start", start_command))
+        app.add_handler(CommandHandler("status", status_command))
+
+        app.add_handler(MessageHandler(filters.VOICE, voice_message_handler))
+        app.add_handler(MessageHandler(filters.VIDEO_NOTE, video_note_message_handler))
+
+        logger.info("Обработчики команд и сообщений настроены")
+
+    def _setup_jobs(self):
+        """Настройка периодических задач."""
+        job_queue = self.application.job_queue
+
+        job_queue.run_repeating(
+            self._cleanup_task,
+            interval=self.config.CLEANUP_INTERVAL * 3600,
+            first=300,
+            name="cleanup_temp_files"
+        )
+        logger.info(f"Очистка временных файлов настроена (каждые {self.config.CLEANUP_INTERVAL} часов)")
+
+    async def _cleanup_task(self, context: ContextTypes.DEFAULT_TYPE):
+        """Периодическая задача очистки временных файлов."""
+        try:
+            logger.info("Запуск очистки временных файлов")
+
+            removed_count = cleanup_temp_files(
+                self.config.AUDIO_TEMP_DIR,
+                max_age_hours=self.config.CLEANUP_INTERVAL,
+                file_patterns=['*.ogg', '*.wav', '*.mp3', '*.tmp']
             )
 
-    except Exception as e:
-        logger.exception("Ошибка при обработке голосового сообщения")
-        await update.message.reply_text(
-            f"<b>{user_name}:</b>\n[Произошла ошибка при обработке сообщения]",
-            parse_mode='HTML'
-        )
+            if removed_count > 0:
+                logger.info(f"Очищено {removed_count} временных файлов")
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Бот активен и готов расшифровывать голосовые сообщения!")
+            logger.info("Очистка временных файлов завершена")
+
+        except Exception as e:
+            logger.error(f"Ошибка при очистке временных файлов: {e}")
+
+    async def _shutdown_handler(self, application):
+        """Обработчик корректного завершения работы."""
+        logger.info("🛑 Завершение работы бота...")
+
+        try:
+            cleanup_temp_files(self.config.AUDIO_TEMP_DIR, max_age_hours=0)
+            logger.info("✅ Бот корректно завершил работу")
+
+        except Exception as e:
+            logger.error(f"Ошибка при завершении работы: {e}")
+
+    def run_sync(self):
+        """Синхронный запуск бота."""
+        try:
+            local_tz = pytz.timezone(self.config.TIME_ZONE)
+            defaults = Defaults(parse_mode='HTML', tzinfo=local_tz)
+            builder = Application.builder().token(self.config.BOT_TOKEN).defaults(defaults)
+
+            builder.post_init(self._post_init_callback)
+            builder.post_shutdown(self._shutdown_handler)
+
+            self.application = builder.build()
+
+            self._setup_handlers()
+            self._setup_jobs()
+
+            logger.info("🤖 Запуск Telegram бота...")
+            self.application.run_polling(
+                allowed_updates=["message"],
+                drop_pending_updates=True
+            )
+
+        except KeyboardInterrupt:
+            logger.info("Получен сигнал прерывания")
+        except Exception as e:
+            logger.error(f"Критическая ошибка: {e}")
+            raise
+
 
 def main():
-    # Замените 'YOUR_TELEGRAM_BOT_TOKEN' на токен вашего бота
-    app = ApplicationBuilder().token("YOUR_TELEGRAM_BOT_TOKEN").build()
+    """Главная функция."""
+    try:
+        bot = TelegramBot()
+        bot.run_sync()
+    except Exception as e:
+        logger.error(f"Фатальная ошибка: {e}")
+        sys.exit(1)
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.VOICE, voice_message_handler))
 
-    # Запускаем бота
-    app.run_polling(close_loop=False)
-
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        logger.info("Программа прервана пользователем")
+    except Exception as e:
+        logger.error(f"Неожиданная ошибка: {e}")
+        sys.exit(1)

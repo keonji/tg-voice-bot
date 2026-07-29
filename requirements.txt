@@ -1,0 +1,23 @@
+# Telegram Bot API
+python-telegram-bot[job-queue]==20.7
+
+# Асинхронность и утилиты
+python-dotenv>=1.0.0
+httpx==0.25.2
+pytz>=2023.3
+
+# Транскрибация голоса
+faster-whisper>=1.1.0
+
+# Fallback-движок при USE_FASTER_WHISPER=false (в обычной конфигурации не нужен)
+# openai-whisper>=20240930
+
+# Восстановление пунктуации (silero_te через torch.hub).
+# Сервер работает на CPU — ставьте CPU-сборку, она втрое меньше CUDA-варианта:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch>=2.2.0
+
+# Тестирование (опционально, для разработки)
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+pytest-mock>=3.10.0
