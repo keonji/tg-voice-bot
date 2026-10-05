@@ -20,8 +20,12 @@ SOURCE_FILES = [
     "handlers/__init__.py",
     "handlers/commands.py",
     "handlers/messages.py",
+    "handlers/instagram.py",
     "services/__init__.py",
     "services/transcription_service.py",
+    "services/instagram_service.py",
+    "services/chat_settings.py",
+    "services/media_tools.py",
     "utils/__init__.py",
     "utils/file_utils.py",
 ]
@@ -30,6 +34,7 @@ SOURCE_FILES = [
 PUBLIC_IMPORTS = [
     "from security import get_auth_manager, InputValidator, validate_text_input",
     "from handlers import start_command, status_command, voice_message_handler",
+    "from handlers import instagram_command, instagram_link_handler",
     "from services import get_transcription_service",
     "from utils import cleanup_temp_files",
 ]
@@ -37,6 +42,7 @@ PUBLIC_IMPORTS = [
 TEST_FILES = [
     "tests/test_security.py",
     "tests/test_utils.py",
+    "tests/test_instagram.py",
 ]
 
 

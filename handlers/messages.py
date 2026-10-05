@@ -14,12 +14,12 @@ from services.transcription_service import get_transcription_service
 logger = logging.getLogger(__name__)
 
 
-async def _keep_typing(bot, chat_id: int, stop_event: asyncio.Event):
-    """Периодически шлёт 'typing' пока идёт длинная операция (TG скрывает индикатор через ~5с)."""
+async def _keep_typing(bot, chat_id: int, stop_event: asyncio.Event, action: str = "typing"):
+    """Периодически шлёт chat action пока идёт длинная операция (TG скрывает индикатор через ~5с)."""
     try:
         while not stop_event.is_set():
             try:
-                await bot.send_chat_action(chat_id, "typing")
+                await bot.send_chat_action(chat_id, action)
             except Exception:
                 pass
             try:

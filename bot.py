@@ -14,7 +14,8 @@ import pytz
 from security import get_auth_manager
 from handlers import (
     start_command, status_command,
-    voice_message_handler, video_note_message_handler
+    voice_message_handler, video_note_message_handler,
+    instagram_command, instagram_link_handler
 )
 from utils import cleanup_temp_files
 
@@ -45,8 +46,9 @@ class BotConfig:
 
         self.AUDIO_TEMP_DIR = Path(os.getenv("AUDIO_TEMP_DIR", "./temp_audio"))
         self.MODELS_DIR = Path(os.getenv("MODELS_DIR", "./models"))
+        self.DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
 
-        for directory in [self.AUDIO_TEMP_DIR, self.MODELS_DIR]:
+        for directory in [self.AUDIO_TEMP_DIR, self.MODELS_DIR, self.DATA_DIR]:
             directory.mkdir(parents=True, exist_ok=True)
 
         self.TIME_ZONE = os.getenv("TIME_ZONE", "Europe/Moscow")
@@ -88,9 +90,13 @@ class TelegramBot:
 
         app.add_handler(CommandHandler("start", start_command))
         app.add_handler(CommandHandler("status", status_command))
+        app.add_handler(CommandHandler("instagram", instagram_command))
 
         app.add_handler(MessageHandler(filters.VOICE, voice_message_handler))
         app.add_handler(MessageHandler(filters.VIDEO_NOTE, video_note_message_handler))
+        app.add_handler(MessageHandler(
+            (filters.TEXT & ~filters.COMMAND) | filters.CAPTION, instagram_link_handler
+        ))
 
         logger.info("Обработчики команд и сообщений настроены")
 

@@ -12,9 +12,16 @@ from .messages import (
     video_note_message_handler,
 )
 
+from .instagram import (
+    instagram_command,
+    instagram_link_handler,
+)
+
 __all__ = [
     'start_command',
     'status_command',
     'voice_message_handler',
     'video_note_message_handler',
+    'instagram_command',
+    'instagram_link_handler',
 ]

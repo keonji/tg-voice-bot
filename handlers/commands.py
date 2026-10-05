@@ -23,6 +23,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Просто отправьте боту:\n"
             "🎙️ Голосовое сообщение → автоматическая транскрибация\n"
             "🎥 Видеосообщение (кружок) → извлечение аудио + транскрибация\n"
+            "📸 Ссылка на Instagram → видео или фото из поста (в группах — /instagram on)\n"
         )
 
         if user_info['is_admin']:
