@@ -5,10 +5,11 @@
 import asyncio
 import logging
 from contextlib import ExitStack
-from typing import List
+from typing import List, Optional
 
 from telegram import InputMediaPhoto, InputMediaVideo, Message, MessageEntity, Update
 from telegram.constants import ChatMemberStatus, ChatType
+from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 from security import check_admin_access, get_user_info_safe
@@ -115,6 +116,7 @@ async def _process_post(message: Message, context: ContextTypes.DEFAULT_TYPE, ur
     try:
         async with service.fetch(url) as items:
             await _send_media(message, items)
+            service.remember_file_ids(url, items)
         logger.info(f"Instagram: {url} отправлен ({len(items)} файлов)")
 
     except InstagramDownloadError as e:
@@ -174,39 +176,62 @@ def chunk_media(items: list, limit: int = MEDIA_GROUP_LIMIT) -> List[list]:
     return chunks
 
 
+def _sent_file_id(sent: Message, item: MediaItem) -> Optional[str]:
+    """file_id из ответа Telegram. Видео, превращённое Telegram в анимацию, не запоминаем — sendVideo его не примет."""
+    if item.is_video:
+        return sent.video.file_id if sent.video else None
+    return sent.photo[-1].file_id if sent.photo else None
+
+
+async def _send_unit(message: Message, unit: List[MediaItem], caption: Optional[str],
+                     use_file_ids: bool) -> List[Message]:
+    """Одно сообщение (файл или альбом). Возвращает отправленные сообщения в порядке unit."""
+    with ExitStack() as stack:
+        def source(item: MediaItem):
+            if use_file_ids and item.file_id:
+                return item.file_id
+            return stack.enter_context(open(item.path, "rb"))
+
+        if len(unit) == 1:
+            item = unit[0]
+            if item.is_video:
+                return [await message.reply_video(
+                    video=source(item), caption=caption, width=item.width, height=item.height,
+                    duration=item.duration, supports_streaming=True, quote=True, **UPLOAD_TIMEOUTS,
+                )]
+            return [await message.reply_photo(photo=source(item), caption=caption, quote=True, **UPLOAD_TIMEOUTS)]
+
+        media = []
+        for n, item in enumerate(unit):
+            item_caption = caption if n == 0 else None
+            if item.is_video:
+                media.append(InputMediaVideo(
+                    source(item), caption=item_caption, width=item.width, height=item.height,
+                    duration=item.duration, supports_streaming=True,
+                ))
+            else:
+                media.append(InputMediaPhoto(source(item), caption=item_caption))
+        return list(await message.reply_media_group(media=media, quote=True, **UPLOAD_TIMEOUTS))
+
+
 async def _send_media(message: Message, items: List[MediaItem]):
+    """Отправляет медиа ответом; проставляет item.file_id по ответу Telegram."""
     sendable = [item for item in items if item.path]
     caption = build_caption(items) or None
     if not sendable:
         await message.reply_text(caption, quote=True)
         return
 
-    with ExitStack() as stack:
-        def open_file(item: MediaItem):
-            return stack.enter_context(open(item.path, "rb"))
-
-        if len(sendable) == 1:
-            item = sendable[0]
-            if item.is_video:
-                await message.reply_video(
-                    video=open_file(item), caption=caption, width=item.width, height=item.height,
-                    duration=item.duration, supports_streaming=True, quote=True, **UPLOAD_TIMEOUTS,
-                )
-            else:
-                await message.reply_photo(photo=open_file(item), caption=caption, quote=True, **UPLOAD_TIMEOUTS)
-            return
-
-        first = True
-        for chunk in chunk_media(sendable):
-            media = []
-            for item in chunk:
-                item_caption = caption if first else None
-                first = False
-                if item.is_video:
-                    media.append(InputMediaVideo(
-                        open_file(item), caption=item_caption, width=item.width, height=item.height,
-                        duration=item.duration, supports_streaming=True,
-                    ))
-                else:
-                    media.append(InputMediaPhoto(open_file(item), caption=item_caption))
-            await message.reply_media_group(media=media, quote=True, **UPLOAD_TIMEOUTS)
+    units = [sendable] if len(sendable) == 1 else chunk_media(sendable)
+    for unit in units:
+        use_file_ids = any(item.file_id for item in unit)
+        try:
+            sent = await _send_unit(message, unit, caption, use_file_ids)
+        except BadRequest as e:
+            if not use_file_ids:
+                raise
+            logger.warning(f"Instagram: Telegram отклонил file_id ({e}), загружаем файлы заново")
+            sent = await _send_unit(message, unit, caption, use_file_ids=False)
+        caption = None
+        for item, sent_message in zip(unit, sent):
+            item.file_id = _sent_file_id(sent_message, item)

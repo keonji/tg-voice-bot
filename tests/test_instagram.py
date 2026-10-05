@@ -11,6 +11,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from telegram.error import BadRequest
+
 from handlers import instagram as ig_handlers
 from handlers.instagram import build_caption, chunk_media, _send_media
 from services.chat_settings import ChatSettings
@@ -211,6 +213,73 @@ class TestSendMedia:
         assert "№3" in media[0].caption
 
 
+def sent_video(file_id):
+    return MagicMock(video=MagicMock(file_id=file_id), photo=[])
+
+
+def sent_photo(file_id):
+    return MagicMock(video=None, photo=[MagicMock(file_id="thumb"), MagicMock(file_id=file_id)])
+
+
+class TestFileIds:
+    @pytest.mark.asyncio
+    async def test_upload_records_file_id(self, tmp_path):
+        message = MagicMock(reply_video=AsyncMock(return_value=sent_video("VID")))
+        items = make_files(tmp_path, [video()])
+        await _send_media(message, items)
+        assert items[0].file_id == "VID"
+
+    @pytest.mark.asyncio
+    async def test_resend_uses_file_id_without_file(self, tmp_path):
+        message = MagicMock(reply_video=AsyncMock(return_value=sent_video("VID")))
+        item = video(str(tmp_path / "gone.mp4"))
+        item.file_id = "VID"
+        await _send_media(message, [item])
+        assert message.reply_video.await_args.kwargs["video"] == "VID"
+
+    @pytest.mark.asyncio
+    async def test_rejected_file_id_falls_back_to_upload(self, tmp_path):
+        message = MagicMock(reply_video=AsyncMock(side_effect=[BadRequest("Wrong file identifier"),
+                                                               sent_video("NEW")]))
+        items = make_files(tmp_path, [video()])
+        items[0].file_id = "STALE"
+        await _send_media(message, items)
+        calls = message.reply_video.await_args_list
+        assert calls[0].kwargs["video"] == "STALE"
+        assert not isinstance(calls[1].kwargs["video"], str)
+        assert items[0].file_id == "NEW"
+
+    @pytest.mark.asyncio
+    async def test_upload_error_without_file_id_propagates(self, tmp_path):
+        message = MagicMock(reply_video=AsyncMock(side_effect=BadRequest("too big")))
+        with pytest.raises(BadRequest):
+            await _send_media(message, make_files(tmp_path, [video()]))
+        assert message.reply_video.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_video_turned_into_animation_not_remembered(self, tmp_path):
+        message = MagicMock(reply_video=AsyncMock(return_value=MagicMock(video=None, photo=[])))
+        items = make_files(tmp_path, [video()])
+        await _send_media(message, items)
+        assert items[0].file_id is None
+
+    @pytest.mark.asyncio
+    async def test_album_file_ids_in_order(self, tmp_path):
+        message = MagicMock(reply_media_group=AsyncMock(return_value=(sent_photo("P1"), sent_video("V2"))))
+        items = make_files(tmp_path, [photo("a.jpg"), video("b.mp4")])
+        await _send_media(message, items)
+        assert [i.file_id for i in items] == ["P1", "V2"]
+
+    @pytest.mark.asyncio
+    async def test_album_mixes_file_ids_and_uploads(self, tmp_path):
+        message = MagicMock(reply_media_group=AsyncMock(return_value=(sent_photo("P1"), sent_video("V2"))))
+        items = make_files(tmp_path, [photo("a.jpg"), video("b.mp4")])
+        items[0].file_id = "P1"
+        await _send_media(message, items)
+        media = message.reply_media_group.await_args.kwargs["media"]
+        assert media[0].media == "P1"
+
+
 def make_update(text, chat_id=-100, chat_type="supergroup"):
     message = MagicMock()
     message.text = text
@@ -403,6 +472,26 @@ class TestMediaCache:
             pass
         item = service.cache.load("A1")[0]
         assert (item.has_audio, item.width, item.height, item.duration, item.compressed) == (False, 1, 2, 3, True)
+
+    @pytest.mark.asyncio
+    async def test_file_ids_saved_without_extending_ttl(self, tmp_path, monkeypatch):
+        service = make_service(tmp_path, monkeypatch, downloaded(tmp_path, "a.mp4", "b.jpg"))
+        async with service.fetch(self.URL) as items:
+            items[0].file_id, items[1].file_id = "V", "P"
+            manifest = service.cache.root / "A1" / MediaCache.MANIFEST
+            old = time.time() - 1000
+            os.utime(manifest, (old, old))
+            service.remember_file_ids(self.URL, items)
+        assert manifest.stat().st_mtime == pytest.approx(old)
+        assert [i.file_id for i in service.cache.load("A1")] == ["V", "P"]
+
+    @pytest.mark.asyncio
+    async def test_file_ids_not_saved_for_uncached_post(self, tmp_path, monkeypatch):
+        service = make_service(tmp_path, monkeypatch, downloaded(tmp_path, "a.mp4"), ttl=0)
+        async with service.fetch(self.URL) as items:
+            items[0].file_id = "V"
+            service.remember_file_ids(self.URL, items)
+        assert not (service.cache.root / "A1").exists()
 
     def test_stale_work_dirs_purged(self, tmp_path, monkeypatch):
         service = make_service(tmp_path, monkeypatch, AsyncMock())

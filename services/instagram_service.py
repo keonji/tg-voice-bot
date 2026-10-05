@@ -88,6 +88,8 @@ class MediaItem:
     height: Optional[int] = None
     duration: Optional[int] = None
     compressed: bool = False
+    # Идентификатор уже загруженного в Telegram файла: повторная отправка без заливки
+    file_id: Optional[str] = None
 
 
 class MediaCache:
@@ -97,6 +99,8 @@ class MediaCache:
     """
 
     MANIFEST = "manifest.json"
+    # Отдельный файл, чтобы не трогать mtime манифеста, от которого считается TTL
+    FILE_IDS = "file_ids.json"
 
     def __init__(self, root: Path, ttl: int):
         self.root = root
@@ -124,7 +128,26 @@ class MediaCache:
             return None
         if not all(item.path.exists() for item in items):
             return None
+        try:
+            file_ids = json.loads((post_dir / self.FILE_IDS).read_text(encoding="utf-8"))
+            if len(file_ids) == len(items):
+                for item, file_id in zip(items, file_ids):
+                    item.file_id = file_id
+        except (OSError, ValueError):
+            pass
         return items
+
+    def save_file_ids(self, shortcode: str, items: List[MediaItem]):
+        """Запоминает file_id отправленных элементов, если пост лежит в кэше."""
+        post_dir = self._dir(shortcode)
+        if self.ttl <= 0 or not (post_dir / self.MANIFEST).exists():
+            return
+        if not any(item.file_id for item in items):
+            return
+        try:
+            (post_dir / self.FILE_IDS).write_text(json.dumps([item.file_id for item in items]), encoding="utf-8")
+        except OSError as e:
+            logger.warning(f"Кэш {shortcode}: не удалось сохранить file_id: {e}")
 
     def store(self, shortcode: str, items: List[MediaItem]) -> Optional[List[MediaItem]]:
         """Переносит файлы в кэш. Посты с неподготовленными элементами не кэшируются — сбой мог быть случайным."""
@@ -141,7 +164,7 @@ class MediaCache:
             target = post_dir / f"{n:03d}{item.path.suffix.lower()}"
             shutil.move(str(item.path), target)
             cached.append(MediaItem(**{**asdict(item), "path": target}))
-            records.append({**asdict(item), "path": target.name})
+            records.append({**asdict(item), "path": target.name, "file_id": None})
         # manifest пишется последним: его mtime — момент готовности кэша
         (post_dir / self.MANIFEST).write_text(json.dumps(records, ensure_ascii=False), encoding="utf-8")
         return cached
@@ -250,6 +273,9 @@ class InstagramService:
         finally:
             if work_dir:
                 self.cleanup(work_dir)
+
+    def remember_file_ids(self, url: str, items: List[MediaItem]):
+        self.cache.save_file_ids(shortcode_from_url(url), items)
 
     def purge(self) -> int:
         """Удаляет просроченный кэш и брошенные рабочие директории (после падения процесса)."""
