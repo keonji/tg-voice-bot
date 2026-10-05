@@ -106,16 +106,15 @@ async def instagram_link_handler(update: Update, context: ContextTypes.DEFAULT_T
 
 async def _process_post(message: Message, context: ContextTypes.DEFAULT_TYPE, url: str):
     service = get_instagram_service()
-    logger.info(f"Instagram: скачивание {url} для чата {message.chat_id}")
+    logger.info(f"Instagram: {url} для чата {message.chat_id}")
 
     stop_action = asyncio.Event()
     action_task = asyncio.create_task(
         _keep_typing(context.bot, message.chat_id, stop_action, action="upload_video")
     )
-    work_dir = None
     try:
-        work_dir, items = await service.download(url)
-        await _send_media(message, items)
+        async with service.fetch(url) as items:
+            await _send_media(message, items)
         logger.info(f"Instagram: {url} отправлен ({len(items)} файлов)")
 
     except InstagramDownloadError as e:
@@ -130,9 +129,6 @@ async def _process_post(message: Message, context: ContextTypes.DEFAULT_TYPE, ur
     finally:
         stop_action.set()
         await action_task
-        # Медиа на диске не храним: после отправки (или неудачи) директория больше не нужна
-        if work_dir:
-            service.cleanup(work_dir)
 
 
 def _numbers(items: List[MediaItem], predicate) -> str:

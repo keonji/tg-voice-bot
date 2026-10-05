@@ -10,9 +10,12 @@ import re
 import shutil
 import sys
 import tempfile
-from dataclasses import dataclass
+import time
+from collections import defaultdict
+from contextlib import asynccontextmanager
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import AsyncIterator, Dict, List, Optional
 from urllib.parse import urljoin
 
 import httpx
@@ -50,6 +53,7 @@ BROWSER_HEADERS = {
 INSTAFIX_HEADERS = {"User-Agent": "TelegramBot (like TwitterBot)"}
 INSTAFIX_OUT_OF_RANGE = "Media number out of range"
 MAX_CAROUSEL_ITEMS = 20
+STALE_WORK_DIR_SECONDS = 3600
 META_RE = re.compile(r'<meta\s+(?:property|name)="([^"]+)"\s+content="([^"]*)"', re.IGNORECASE)
 
 
@@ -84,6 +88,86 @@ class MediaItem:
     height: Optional[int] = None
     duration: Optional[int] = None
     compressed: bool = False
+
+
+class MediaCache:
+    """
+    Готовые к отправке медиа постов на диске: <root>/<shortcode>/ + manifest.json.
+    Время жизни отсчитывается от скачивания; повтор ссылки в течение TTL не качает пост заново.
+    """
+
+    MANIFEST = "manifest.json"
+
+    def __init__(self, root: Path, ttl: int):
+        self.root = root
+        self.ttl = ttl
+        self._in_use: Dict[str, int] = defaultdict(int)
+
+    def _dir(self, shortcode: str) -> Path:
+        return self.root / shortcode
+
+    def _expired(self, post_dir: Path, now: float) -> bool:
+        try:
+            return now - (post_dir / self.MANIFEST).stat().st_mtime >= self.ttl
+        except FileNotFoundError:
+            return True
+
+    def load(self, shortcode: str) -> Optional[List[MediaItem]]:
+        post_dir = self._dir(shortcode)
+        if self.ttl <= 0 or self._expired(post_dir, time.time()):
+            return None
+        try:
+            records = json.loads((post_dir / self.MANIFEST).read_text(encoding="utf-8"))
+            items = [MediaItem(**{**r, "path": post_dir / r["path"]}) for r in records]
+        except (OSError, ValueError, TypeError, KeyError) as e:
+            logger.warning(f"Кэш {shortcode} повреждён: {e}")
+            return None
+        if not all(item.path.exists() for item in items):
+            return None
+        return items
+
+    def store(self, shortcode: str, items: List[MediaItem]) -> Optional[List[MediaItem]]:
+        """Переносит файлы в кэш. Посты с неподготовленными элементами не кэшируются — сбой мог быть случайным."""
+        if self.ttl <= 0 or not items or not all(item.path for item in items):
+            return None
+        # Просроченная копия ещё отправляется — не трогаем её, этот раз обходимся без кэша
+        if self._in_use.get(shortcode):
+            return None
+        post_dir = self._dir(shortcode)
+        shutil.rmtree(post_dir, ignore_errors=True)
+        post_dir.mkdir(parents=True)
+        cached, records = [], []
+        for n, item in enumerate(items, 1):
+            target = post_dir / f"{n:03d}{item.path.suffix.lower()}"
+            shutil.move(str(item.path), target)
+            cached.append(MediaItem(**{**asdict(item), "path": target}))
+            records.append({**asdict(item), "path": target.name})
+        # manifest пишется последним: его mtime — момент готовности кэша
+        (post_dir / self.MANIFEST).write_text(json.dumps(records, ensure_ascii=False), encoding="utf-8")
+        return cached
+
+    @asynccontextmanager
+    async def using(self, shortcode: str) -> AsyncIterator[None]:
+        """Пока пост отправляется, purge его не трогает, даже если TTL истёк."""
+        self._in_use[shortcode] += 1
+        try:
+            yield
+        finally:
+            self._in_use[shortcode] -= 1
+            if not self._in_use[shortcode]:
+                del self._in_use[shortcode]
+
+    def purge(self) -> int:
+        if not self.root.exists():
+            return 0
+        now, removed = time.time(), 0
+        for post_dir in self.root.iterdir():
+            if not post_dir.is_dir() or self._in_use.get(post_dir.name):
+                continue
+            if self._expired(post_dir, now):
+                shutil.rmtree(post_dir, ignore_errors=True)
+                removed += 1
+        return removed
 
 
 @dataclass
@@ -136,7 +220,48 @@ class InstagramService:
         self.instafix_hosts = [h.strip() for h in os.getenv("INSTAFIX_HOSTS", "instagramfix.com").split(",")
                                if h.strip()]
         self._semaphore = asyncio.Semaphore(int(os.getenv("INSTAGRAM_MAX_PARALLEL", "2")))
+        self._post_locks: Dict[str, asyncio.Lock] = {}
+        self.cache = MediaCache(self.temp_root / "cache", int(os.getenv("INSTAGRAM_CACHE_TTL", "3600")))
         self.media_tools = MediaTools()
+
+    @asynccontextmanager
+    async def fetch(self, url: str) -> AsyncIterator[List[MediaItem]]:
+        """
+        Медиа поста: из кэша или со скачиванием. Файлы валидны только внутри контекста;
+        после выхода некэшированные удаляются, кэшированные живут до истечения TTL.
+        """
+        shortcode = shortcode_from_url(url)
+        lock = self._post_locks.setdefault(shortcode, asyncio.Lock())
+        work_dir = None
+        # Лок на пост: вторая такая же ссылка ждёт первую и берёт результат из кэша
+        async with lock:
+            items = self.cache.load(shortcode)
+            if items is not None:
+                logger.info(f"Instagram: {shortcode} из кэша")
+            else:
+                work_dir, items = await self.download(url)
+                cached = self.cache.store(shortcode, items)
+                if cached is not None:
+                    self.cleanup(work_dir)
+                    work_dir, items = None, cached
+        try:
+            async with self.cache.using(shortcode):
+                yield items
+        finally:
+            if work_dir:
+                self.cleanup(work_dir)
+
+    def purge(self) -> int:
+        """Удаляет просроченный кэш и брошенные рабочие директории (после падения процесса)."""
+        removed = self.cache.purge()
+        if self.temp_root.exists():
+            now = time.time()
+            for work_dir in self.temp_root.glob("ig_*"):
+                # Скачивание с перекодированием ограничено таймаутами, час заведомо больше
+                if work_dir.is_dir() and now - work_dir.stat().st_mtime > STALE_WORK_DIR_SECONDS:
+                    self.cleanup(work_dir)
+                    removed += 1
+        return removed
 
     async def download(self, url: str) -> tuple[Path, List[MediaItem]]:
         """

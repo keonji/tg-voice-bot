@@ -18,6 +18,7 @@ from handlers import (
     instagram_command, instagram_link_handler
 )
 from utils import cleanup_temp_files
+from services.instagram_service import get_instagram_service
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -111,6 +112,17 @@ class TelegramBot:
             name="cleanup_temp_files"
         )
         logger.info(f"Очистка временных файлов настроена (каждые {self.config.CLEANUP_INTERVAL} часов)")
+
+        job_queue.run_repeating(self._instagram_purge_task, interval=300, first=10, name="instagram_cache")
+
+    async def _instagram_purge_task(self, context: ContextTypes.DEFAULT_TYPE):
+        """Удаляет медиа Instagram, пролежавшие в кэше дольше INSTAGRAM_CACHE_TTL."""
+        try:
+            removed = get_instagram_service().purge()
+            if removed:
+                logger.info(f"Кэш Instagram: удалено {removed} постов")
+        except Exception as e:
+            logger.error(f"Ошибка очистки кэша Instagram: {e}")
 
     async def _cleanup_task(self, context: ContextTypes.DEFAULT_TYPE):
         """Периодическая задача очистки временных файлов."""

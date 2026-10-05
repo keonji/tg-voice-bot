@@ -2,7 +2,10 @@
 Тесты пересылки медиа из Instagram.
 """
 
+import asyncio
 import json
+import os
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -12,7 +15,7 @@ from handlers import instagram as ig_handlers
 from handlers.instagram import build_caption, chunk_media, _send_media
 from services.chat_settings import ChatSettings
 from services.instagram_service import (
-    InstagramDownloadError, InstagramService, MediaItem, extract_instagram_urls, parse_entries,
+    InstagramDownloadError, InstagramService, MediaCache, MediaItem, extract_instagram_urls, parse_entries,
     parse_instafix_page,
 )
 from services.media_tools import (
@@ -221,67 +224,196 @@ def make_update(text, chat_id=-100, chat_type="supergroup"):
     return MagicMock(message=message)
 
 
+def make_service(tmp_path, monkeypatch, download, ttl=3600):
+    monkeypatch.setenv("AUDIO_TEMP_DIR", str(tmp_path / "tmp"))
+    monkeypatch.setenv("INSTAGRAM_CACHE_TTL", str(ttl))
+    service = InstagramService()
+    service.download = download
+    return service
+
+
+def downloaded(tmp_path, *names):
+    """Фабрика результата download(): свежая рабочая директория с файлами."""
+    counter = {"n": 0}
+
+    async def download(url):
+        counter["n"] += 1
+        work_dir = tmp_path / f"work{counter['n']}"
+        work_dir.mkdir()
+        items = []
+        for name in names:
+            (work_dir / name).write_bytes(b"x")
+            items.append(video(str(work_dir / name)) if name.endswith(".mp4") else photo(str(work_dir / name)))
+        return work_dir, items
+
+    return AsyncMock(side_effect=download)
+
+
+def make_context():
+    context = MagicMock()
+    context.bot.send_chat_action = AsyncMock()
+    return context
+
+
 class TestLinkHandler:
-    @pytest.mark.asyncio
-    async def test_private_chat_enabled_by_default_but_can_be_disabled(self, tmp_path):
+    @pytest.fixture
+    def settings(self, tmp_path):
         settings = ChatSettings(tmp_path / "s.json")
-        service = MagicMock(download=AsyncMock(side_effect=InstagramDownloadError("x")))
-        context = MagicMock()
-        context.bot.send_chat_action = AsyncMock()
+        settings.set_enabled(-100, ChatSettings.INSTAGRAM, True)
+        return settings
+
+    @pytest.mark.asyncio
+    async def test_private_chat_enabled_by_default_but_can_be_disabled(self, tmp_path, monkeypatch):
+        settings = ChatSettings(tmp_path / "s.json")
+        service = make_service(tmp_path, monkeypatch, AsyncMock(side_effect=InstagramDownloadError("x")))
         with patch.object(ig_handlers, "get_chat_settings", return_value=settings), \
                 patch.object(ig_handlers, "get_instagram_service", return_value=service):
             await ig_handlers.instagram_link_handler(
-                make_update("https://instagram.com/p/A1/", chat_id=42, chat_type="private"), context)
+                make_update("https://instagram.com/p/A1/", chat_id=42, chat_type="private"), make_context())
             assert service.download.await_count == 1
 
             settings.set_enabled(42, ChatSettings.INSTAGRAM, False)
             await ig_handlers.instagram_link_handler(
-                make_update("https://instagram.com/p/A1/", chat_id=42, chat_type="private"), context)
+                make_update("https://instagram.com/p/A1/", chat_id=42, chat_type="private"), make_context())
             assert service.download.await_count == 1
 
     @pytest.mark.asyncio
-    async def test_disabled_chat_ignored(self, tmp_path):
+    async def test_disabled_chat_ignored(self, tmp_path, monkeypatch):
         settings = ChatSettings(tmp_path / "s.json")
-        service = MagicMock(download=AsyncMock())
+        service = make_service(tmp_path, monkeypatch, AsyncMock())
         with patch.object(ig_handlers, "get_chat_settings", return_value=settings), \
                 patch.object(ig_handlers, "get_instagram_service", return_value=service):
-            await ig_handlers.instagram_link_handler(make_update("https://instagram.com/p/A1/"), MagicMock())
+            await ig_handlers.instagram_link_handler(make_update("https://instagram.com/p/A1/"), make_context())
         service.download.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_cleanup_after_success_and_failure(self, tmp_path):
-        settings = ChatSettings(tmp_path / "s.json")
-        settings.set_enabled(-100, ChatSettings.INSTAGRAM, True)
-        work_dir = tmp_path / "work"
-        service = MagicMock(download=AsyncMock(return_value=(work_dir, [video()])), cleanup=MagicMock())
-        context = MagicMock()
-        context.bot.send_chat_action = AsyncMock()
+    async def test_repeated_link_served_from_cache(self, tmp_path, monkeypatch, settings):
+        service = make_service(tmp_path, monkeypatch, downloaded(tmp_path, "a.mp4", "b.jpg"))
+        sent = []
+
+        async def send(message, items):
+            sent.append([(i.path, i.path.read_bytes()) for i in items])
 
         with patch.object(ig_handlers, "get_chat_settings", return_value=settings), \
                 patch.object(ig_handlers, "get_instagram_service", return_value=service), \
-                patch.object(ig_handlers, "_send_media", AsyncMock()) as send:
-            await ig_handlers.instagram_link_handler(make_update("https://instagram.com/p/A1/"), context)
-            send.assert_awaited_once()
-            service.cleanup.assert_called_once_with(work_dir)
+                patch.object(ig_handlers, "_send_media", side_effect=send):
+            for _ in range(2):
+                await ig_handlers.instagram_link_handler(make_update("https://instagram.com/reel/A1/"), make_context())
 
-            send.side_effect = RuntimeError("upload failed")
-            update = make_update("https://instagram.com/p/A1/")
-            await ig_handlers.instagram_link_handler(update, context)
-            assert service.cleanup.call_count == 2
-            update.message.reply_text.assert_awaited_once()
+        assert service.download.await_count == 1
+        assert sent[0] == sent[1]
+        assert not (tmp_path / "work1").exists()
 
     @pytest.mark.asyncio
-    async def test_download_error_replies(self, tmp_path):
-        settings = ChatSettings(tmp_path / "s.json")
-        settings.set_enabled(-100, ChatSettings.INSTAGRAM, True)
-        service = MagicMock(download=AsyncMock(side_effect=InstagramDownloadError("429")))
-        context = MagicMock()
-        context.bot.send_chat_action = AsyncMock()
+    async def test_send_failure_keeps_cache(self, tmp_path, monkeypatch, settings):
+        service = make_service(tmp_path, monkeypatch, downloaded(tmp_path, "a.mp4"))
+        update = make_update("https://instagram.com/p/A1/")
+        with patch.object(ig_handlers, "get_chat_settings", return_value=settings), \
+                patch.object(ig_handlers, "get_instagram_service", return_value=service), \
+                patch.object(ig_handlers, "_send_media", AsyncMock(side_effect=RuntimeError("upload failed"))):
+            await ig_handlers.instagram_link_handler(update, make_context())
+        assert "Не удалось загрузить" in update.message.reply_text.await_args.args[0]
+        assert service.cache.load("A1") is not None
+
+    @pytest.mark.asyncio
+    async def test_download_error_replies(self, tmp_path, monkeypatch, settings):
+        service = make_service(tmp_path, monkeypatch, AsyncMock(side_effect=InstagramDownloadError("429")))
         update = make_update("https://instagram.com/p/A1/")
         with patch.object(ig_handlers, "get_chat_settings", return_value=settings), \
                 patch.object(ig_handlers, "get_instagram_service", return_value=service):
-            await ig_handlers.instagram_link_handler(update, context)
+            await ig_handlers.instagram_link_handler(update, make_context())
         assert "Не удалось скачать" in update.message.reply_text.await_args.args[0]
+
+
+class TestMediaCache:
+    URL = "https://www.instagram.com/p/A1/"
+
+    @pytest.mark.asyncio
+    async def test_expired_cache_purged_and_redownloaded(self, tmp_path, monkeypatch):
+        service = make_service(tmp_path, monkeypatch, downloaded(tmp_path, "a.mp4"))
+        async with service.fetch(self.URL):
+            pass
+        post_dir = service.cache.root / "A1"
+        assert post_dir.exists() and service.purge() == 0
+
+        old = time.time() - 3601
+        os.utime(post_dir / MediaCache.MANIFEST, (old, old))
+        assert service.purge() == 1 and not post_dir.exists()
+
+        async with service.fetch(self.URL):
+            pass
+        assert service.download.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_in_use_not_purged(self, tmp_path, monkeypatch):
+        service = make_service(tmp_path, monkeypatch, downloaded(tmp_path, "a.mp4"))
+        async with service.fetch(self.URL) as items:
+            old = time.time() - 3601
+            os.utime(service.cache.root / "A1" / MediaCache.MANIFEST, (old, old))
+            assert service.purge() == 0
+            assert items[0].path.exists()
+        assert service.purge() == 1
+
+    @pytest.mark.asyncio
+    async def test_concurrent_same_link_downloads_once(self, tmp_path, monkeypatch):
+        service = make_service(tmp_path, monkeypatch, downloaded(tmp_path, "a.mp4"))
+
+        async def use():
+            async with service.fetch(self.URL) as items:
+                return items[0].path
+
+        paths = await asyncio.gather(use(), use(), use())
+        assert service.download.await_count == 1
+        assert len(set(paths)) == 1
+
+    @pytest.mark.asyncio
+    async def test_partial_failure_not_cached(self, tmp_path, monkeypatch):
+        async def download(url):
+            work_dir = tmp_path / "w"
+            work_dir.mkdir(exist_ok=True)
+            (work_dir / "a.jpg").write_bytes(b"x")
+            return work_dir, [photo(str(work_dir / "a.jpg")), failed()]
+
+        service = make_service(tmp_path, monkeypatch, AsyncMock(side_effect=download))
+        async with service.fetch(self.URL) as items:
+            assert items[0].path.exists()
+        assert not (tmp_path / "w").exists()
+        assert service.cache.load("A1") is None
+
+    @pytest.mark.asyncio
+    async def test_ttl_zero_deletes_after_send(self, tmp_path, monkeypatch):
+        service = make_service(tmp_path, monkeypatch, downloaded(tmp_path, "a.mp4"), ttl=0)
+        async with service.fetch(self.URL) as items:
+            path = items[0].path
+            assert path.exists()
+        assert not path.exists()
+        assert not (service.cache.root / "A1").exists()
+
+    @pytest.mark.asyncio
+    async def test_metadata_survives_roundtrip(self, tmp_path, monkeypatch):
+        async def download(url):
+            work_dir = tmp_path / "w"
+            work_dir.mkdir()
+            (work_dir / "a.mp4").write_bytes(b"x")
+            return work_dir, [MediaItem(path=work_dir / "a.mp4", is_video=True, has_audio=False,
+                                        width=1, height=2, duration=3, compressed=True)]
+
+        service = make_service(tmp_path, monkeypatch, AsyncMock(side_effect=download))
+        async with service.fetch(self.URL):
+            pass
+        item = service.cache.load("A1")[0]
+        assert (item.has_audio, item.width, item.height, item.duration, item.compressed) == (False, 1, 2, 3, True)
+
+    def test_stale_work_dirs_purged(self, tmp_path, monkeypatch):
+        service = make_service(tmp_path, monkeypatch, AsyncMock())
+        stale = service.temp_root / "ig_old"
+        fresh = service.temp_root / "ig_new"
+        stale.mkdir(parents=True)
+        fresh.mkdir()
+        old = time.time() - 7200
+        os.utime(stale, (old, old))
+        assert service.purge() == 1
+        assert not stale.exists() and fresh.exists()
 
 
 class TestInstafixPage:
